@@ -124,63 +124,6 @@ SPECIALISED
 );
 
 // ── Tool 5: suggest_create_command ───────────────────────────────────────────
-server.tool(
-  'suggest_create_command',
-  'Given a block description, suggest the exact aem-eds-cli create command and all prompt answers the developer should type',
-  {
-    description: z.string().describe('What the block should do e.g. "a carousel with autoplay config and slides with image and caption"'),
-  },
-  async ({ description }) => {
-    // Returns a structured guide for the developer to follow in terminal
-    const guide = `
-Based on your description: "${description}"
-
-Run this in your EDS project terminal:
-
-  npx aem-eds-cli create <block-name>
-
-Then answer the prompts as follows — I will fill in the details
-after you tell me the exact block name you want.
-
-To get my full prompt-by-prompt guide, tell me:
-1. What name should this block have?
-2. Any specific field requirements?
-
-I will then give you every prompt answer step by step.
-    `;
-    return { content: [{ type: 'text', text: guide }] };
-  }
-);
-
-// ── Tool 6: get_block_structure ───────────────────────────────────────────────
-server.tool(
-  'get_block_structure',
-  'Get the folder and file structure of a specific block',
-  {
-    name: z.string().describe('Block name e.g. "hero"'),
-  },
-  async ({ name }) => {
-    const blockDir = path.join(EDS_PROJECT, 'blocks', name);
-    if (!fs.existsSync(blockDir)) {
-      return { content: [{ type: 'text', text: `Block "${name}" not found in blocks/` }] };
-    }
-    const files   = fs.readdirSync(blockDir);
-    const details = files.map(f => {
-      const fPath = path.join(blockDir, f);
-      const size  = fs.statSync(fPath).size;
-      return `  ${f.padEnd(30)} ${size} bytes`;
-    }).join('\n');
-    return {
-      content: [{
-        type: 'text',
-        text: `blocks/${name}/\n${details}`,
-      }],
-    };
-  }
-);
-
-// ── Tool 7: read_component_filters ───────────────────────────────────────────
-// ── Tool: suggest_create_command ─────────────────────────────────────────────
 // Full knowledge of aem-eds-cli exact prompt flow
 
 server.tool(
@@ -519,6 +462,48 @@ server.tool(
     l(`${'─'.repeat(55)}`);
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
+  }
+);
+
+// ── Tool 6: get_block_structure ───────────────────────────────────────────────
+server.tool(
+  'get_block_structure',
+  'Get the folder and file structure of a specific block',
+  {
+    name: z.string().describe('Block name e.g. "hero"'),
+  },
+  async ({ name }) => {
+    const blockDir = path.join(EDS_PROJECT, 'blocks', name);
+    if (!fs.existsSync(blockDir)) {
+      return { content: [{ type: 'text', text: `Block "${name}" not found in blocks/` }] };
+    }
+    const files   = fs.readdirSync(blockDir);
+    const details = files.map(f => {
+      const fPath = path.join(blockDir, f);
+      const size  = fs.statSync(fPath).size;
+      return `  ${f.padEnd(30)} ${size} bytes`;
+    }).join('\n');
+    return {
+      content: [{
+        type: 'text',
+        text: `blocks/${name}/\n${details}`,
+      }],
+    };
+  }
+);
+
+// ── Tool 7: read_component_filters ───────────────────────────────────────────
+server.tool(
+  'read_component_filters',
+  'Read the component-filters.json to see which blocks are in the section filter',
+  {},
+  async () => {
+    const filePath = path.join(EDS_PROJECT, 'component-filters.json');
+    if (!fs.existsSync(filePath)) {
+      return { content: [{ type: 'text', text: 'component-filters.json not found' }] };
+    }
+    const content = fs.readFileSync(filePath, 'utf8');
+    return { content: [{ type: 'text', text: content }] };
   }
 );
 
