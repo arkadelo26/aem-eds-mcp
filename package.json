@@ -1,0 +1,19 @@
+{
+  "name": "aem-eds-mcp",
+  "version": "1.0.0",
+  "main": "server.js",
+  "bin":{
+    "aem-eds-mcp":"./server.js"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["aem", "eds", "cli", "scaffolding", "mcp", "server", "ai", "chat", "agents"],
+  "author": "Arkaprava Majumder <arkmajumder@deloitte.com>",
+  "license": "Apache-2.0",
+  "description": "MCP server for aem eds block scaffolding - connects aem-eds-cli to AI chat agents",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  }
+}
