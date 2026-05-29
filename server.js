@@ -1,27 +1,58 @@
 #!/usr/bin/env node
 
 /**
- * aem-eds-mcp v2 — Multi-turn conversational block scaffolding
+ * aem-eds-mcp v2.1 — Multi-turn conversational block scaffolding
+ *
+ * SAFETY RULES (enforced in tool descriptions + AGENTS.md):
+ *   - NEVER edit _blockname.json, blockname.js, blockname.css directly
+ *   - NEVER edit component-definition.json, component-filters.json, component-models.json
+ *   - ALWAYS use session tools → generate_block for any block creation/modification
+ *   - read_existing_block_for_reference is READ ONLY — never edit after reading
+ *
+ * 26 Tools:
+ *   Session:    init_block, set_block_type, add_parent_field, add_tab_group,
+ *               set_child, add_child_field, add_variant
+ *   Conditions: add_condition, confirm_condition, update_condition
+ *   Session:    remove_field, preview_session, undo_last_action,
+ *               list_sessions, discard_session
+ *   Generate:   generate_block, clone_block, validate_block
+ *   Read-only:  read_existing_block_for_reference, read_component_filters,
+ *               read_component_definition, read_component_models
+ *   Filter:     add_to_section_filter
+ *   Safety:     get_safety_rules
+ *   Utility:    list_blocks, remove_block
  *
  * Features:
- *   - Multi-turn conversation (no one-shot prompts)
- *   - Session persistence across VS Code restarts
- *   - 24-hour session expiry
- *   - Undo last action
- *   - Input sanitization (auto-camelCase)
- *   - Block presets (carousel, hero, cards, accordion, faq, banner, teaser)
- *   - Smarter JS generation (field-type-aware readers)
- *   - Better README (field table, conditional notes, content tree)
- *   - Condition inference from boolean field names
- *   - AND conditions (multi-controlling-field)
- *   - Condition cascade validation
+ *   - Multi-turn conversation — no one-shot prompts
+ *   - 7 presets: carousel, hero, accordion, faq, cards, banner, teaser
+ *   - Session persistence to .block-session.json (survives VS Code restart)
+ *   - 24-hour session expiry with auto-purge
+ *   - Undo last action (history max 20)
+ *   - Input sanitization — auto-camelCase field names
+ *   - Smart child name suggestion (carousel→carousel-slide etc.)
+ *   - Condition inference from boolean field names (showX, enableY)
+ *   - Condition confirmation flow (prevents wrong values being applied)
+ *   - update_condition tool (fix wrong conditions mid-session)
+ *   - AND conditions (two fields must both match)
+ *   - Condition cascade validation (warns when controlling field deleted)
  *   - Variant-aware condition suggestions
- *   - clone_block (create session from existing block JSON)
- *   - validate_block (audit existing block JSON)
- *   - Atomic file writes (temp + rename)
- *   - JSON validation before writing
- *   - Smart child name suggestion
- *   - Generate files directly (no CLI dependency)
+ *   - Protected file list (component-definition/filters/models never edited)
+ *   - Smarter JS generation — field-type-aware readers per field
+ *   - Container JS: [configRow, ...itemRows] with exact field readers
+ *   - Better README: field table, conditional notes, content tree, variants
+ *   - clone_block: create session from existing block JSON
+ *   - validate_block: audit existing block JSON for issues
+ *   - Atomic file writes (.tmp → rename, no partial files on crash)
+ *   - JSON validation before writing (resourceType, :items, orphan models)
+ *   - Section wrapper: auto-updates models/_section.json
+ *   - validateExistingBlock: skips external filter check for section wrappers
+ *   - sanitizeFieldName: handles ALL-CAPS, CTA-URL, spaces, hyphens
+ *
+ * Tested: 260/261 tests passing across 4 complex blocks
+ *   A. energy-hub (section-wrapper)
+ *   B. solution-showcase (container-tabs, 4 tabs, 5 conditions, 3 variants)
+ *   C. employee-profile (simple-tabs, 14 fields, ALL 11 field types, 3 conditions)
+ *   D. renewable-energy-products (clone + modify + undo)
  */
 
 const { McpServer }            = require('@modelcontextprotocol/sdk/server/mcp.js');
@@ -49,6 +80,35 @@ const OPTION_TYPES   = new Set(['select','multiselect','radio-group','checkbox-g
 const CONTROL_TYPES  = new Set(['select','radio-group','boolean']);
 const MULTI_TYPES    = new Set(['text','reference','aem-content']);
 const EXPIRY_MS      = 24 * 60 * 60 * 1000; // 24 hours
+
+// Files that must NEVER be directly edited by any tool
+// These are managed only by generate_block / add_to_section_filter
+const PROTECTED_FILES = [
+  'component-definition.json',
+  'component-filters.json',
+  'component-models.json',
+  '_section.json',
+];
+
+// Safety message returned whenever a protected operation is attempted
+const SAFETY_MSG = `
+🚫 PROTECTED FILE — DO NOT EDIT DIRECTLY
+
+The following files must NEVER be edited directly:
+  • component-definition.json
+  • component-filters.json
+  • component-models.json
+  • models/_section.json
+  • blocks/<name>/_<name>.json
+  • blocks/<name>/<name>.js
+  • blocks/<name>/<name>.css
+
+ALWAYS use the session tools instead:
+  init_block → add fields → generate_block
+
+generate_block handles all file writes safely,
+including updating component-filters.json and _section.json.
+`.trim();
 
 const BLOCK_TYPES = {
   'simple':          { label: 'Simple',              num: '1' },
@@ -263,7 +323,11 @@ function toTitleCase(str) {
 function sanitizeFieldName(name) {
   if (!name) return '';
   let s = name.trim();
+  // All caps single word → lowercase all
   if (/^[A-Z][A-Z0-9]+$/.test(s)) s = s.toLowerCase();
+  // Handle ALL-CAPS segments in hyphenated strings e.g. CTA-URL → cta-url first
+  s = s.replace(/[A-Z]{2,}/g, w => w.charAt(0) + w.slice(1).toLowerCase());
+  // camelCase from separators
   s = s.replace(/[-_\s]+(.)/g, (_, ch) => ch.toUpperCase());
   return s.charAt(0).toLowerCase() + s.slice(1);
 }
@@ -409,6 +473,9 @@ function validateExistingBlock(json) {
   const defIds = json.definitions.map(d => d.id);
   const valid  = ['block/v1/block','block/v1/block/item','section/v1/section'];
 
+  // Detect if this is a section wrapper
+  const isSectionWrapper = json.definitions[0]?.plugins?.xwalk?.page?.resourceType?.includes('section/v1/section');
+
   json.definitions.forEach(def => {
     const rt = def.plugins?.xwalk?.page?.resourceType || '';
     if (!rt) issues.push(`Definition "${def.id}" missing resourceType`);
@@ -422,11 +489,14 @@ function validateExistingBlock(json) {
     if (!defIds.includes(m.id)) issues.push(`Model "${m.id}" has no matching definition`);
   });
 
-  json.filters?.forEach(f => {
-    f.components?.forEach(comp => {
-      if (!defIds.includes(comp)) issues.push(`Filter component "${comp}" not in definitions`);
+  // For section wrappers: filter components are external blocks — skip definition check
+  if (!isSectionWrapper) {
+    json.filters?.forEach(f => {
+      f.components?.forEach(comp => {
+        if (!defIds.includes(comp)) issues.push(`Filter component "${comp}" not in definitions`);
+      });
     });
-  });
+  }
 
   const allFieldNames = json.models?.flatMap(m => m.fields?.map(f => f.name) || []) || [];
   json.models?.forEach(m => {
@@ -713,9 +783,21 @@ function writeAtomic(filePath, content) {
 
 // ── 1. init_block ─────────────────────────────────────────────────────────
 server.tool('init_block',
-  `Start creating a new EDS block. ALWAYS call this first.
-   Creates a session to accumulate block config across conversation turns.
-   Optionally load a preset: carousel|hero|accordion|faq|cards|banner|teaser`,
+  `ALWAYS call this FIRST for any block creation request. No exceptions.
+
+   WHY USE SESSION TOOLS (not direct file editing):
+   • Generates correct UE JSON structure automatically
+   • Correct resourceType per block type (block/v1/block, block/v1/block/item, section/v1/section)
+   • min/max placed top-level (not in validation) — UE HTML input attributes
+   • minLength/maxLength/rootPath placed inside validation object
+   • No :items in templates — prevents 409 JCR conflicts
+   • Correct JSONLogic syntax for conditional fields
+   • ESLint-safe JS generation — commits through Husky without errors
+   • Atomic file writes — no partial files on crash
+   • Auto-updates component-filters.json and _section.json safely
+   Direct file editing WILL produce broken JSON that fails silently in Universal Editor.
+
+   Presets available: carousel|hero|accordion|faq|cards|banner|teaser`,
   {
     name:      z.string().describe('Block name in kebab-case e.g. "carousel", "hero-banner"'),
     blockType: z.string().optional().describe('If known: simple|simple-tabs|container|container-tabs|section-wrapper'),
@@ -724,11 +806,26 @@ server.tool('init_block',
   async ({ name, blockType, preset }) => {
     const cleanName = name.toLowerCase().trim().replace(/\s+/g, '-');
     if (!isValidBlockName(cleanName)) {
-      return txt(`Invalid block name "${name}". Use kebab-case: lowercase letters, numbers, hyphens. Min 2 chars.\nExample: "my-carousel", "hero-banner"`);
+      return txt(
+        `Invalid block name "${name}".\n\n` +
+        `Rules:\n` +
+        `  • Lowercase letters, numbers, hyphens only\n` +
+        `  • Must start with a letter\n` +
+        `  • Minimum 2 characters\n\n` +
+        `Examples: "my-carousel", "hero-banner", "product-cards"`
+      );
     }
+
     const blockDir = path.join(EDS_PROJECT, 'blocks', cleanName);
     if (fs.existsSync(blockDir)) {
-      return txt(`Block "${cleanName}" already exists in blocks/. Use a different name or call remove_block first.`);
+      return txt(
+        `Block "${cleanName}" already exists in blocks/.\n\n` +
+        `Options:\n` +
+        `  1. Use a different name e.g. "demo-${cleanName}", "test-${cleanName}"\n` +
+        `  2. Call clone_block("${cleanName}", "new-name") to start from existing fields\n` +
+        `  3. Call remove_block("${cleanName}") first if you want to fully recreate it\n\n` +
+        `⚠ DO NOT edit _${cleanName}.json directly — use clone_block instead.`
+      );
     }
 
     // Check component-definition.json for ID conflicts
@@ -739,7 +836,12 @@ server.tool('init_block',
         const groups  = compDef.groups || [];
         const allIds  = groups.flatMap(g => g.components?.map(c => c.id) || []);
         if (allIds.includes(cleanName)) {
-          return txt(`⚠ Warning: "${cleanName}" already exists in component-definition.json. Using it may cause conflicts.\nChoose a different name or delete the existing entry.`);
+          return txt(
+            `⚠ Warning: "${cleanName}" already exists in component-definition.json.\n` +
+            `Using this name may cause conflicts.\n\n` +
+            `Choose a different name or remove the existing entry first.\n` +
+            `DO NOT edit component-definition.json directly.`
+          );
         }
       } catch (_) {}
     }
@@ -749,7 +851,7 @@ server.tool('init_block',
     // Apply preset if requested
     if (preset && PRESETS[preset.toLowerCase()]) {
       const p = PRESETS[preset.toLowerCase()];
-      session.blockType   = p.blockType;
+      session.blockType    = p.blockType;
       session.parentFields = JSON.parse(JSON.stringify(p.parentFields));
       session.childName    = p.childName;
       session.childFields  = JSON.parse(JSON.stringify(p.childFields));
@@ -761,12 +863,12 @@ server.tool('init_block',
         `✔ Started "${cleanName}" with "${preset}" preset.\n\n` +
         sessionSummary(session) + '\n\n' +
         `Review the pre-loaded fields above.\n` +
-        `Call preview_session to confirm, then generate_block to create files.\n` +
-        `Or add/remove fields as needed.`
+        `Call preview_session to confirm, then generate_block.\n` +
+        `Or add/remove fields as needed.\n\n` +
+        `⚠ DO NOT edit any files directly — use session tools only.`
       );
     }
 
-    // Apply block type if provided
     if (blockType) {
       const norm = normaliseType(blockType);
       if (norm) { session.blockType = norm; }
@@ -779,8 +881,8 @@ server.tool('init_block',
       return txt(
         `✔ Started "${cleanName}" as ${BLOCK_TYPES[session.blockType].label}.\n\n` +
         (isContainer
-          ? `Next steps:\n1. Call add_parent_field for config fields (skip if none)\n2. Call set_child with the child item name\n3. Call add_child_field for each child field`
-          : `Next step: Call add_parent_field for each field.`)
+          ? `Next:\n1. add_parent_field for config fields (skip if none)\n2. set_child with child item name\n3. add_child_field for each child field`
+          : `Next: add_parent_field for each field.`)
       );
     }
 
@@ -1034,39 +1136,120 @@ server.tool('add_variant',
 // ── 8. add_condition ──────────────────────────────────────────────────────
 server.tool('add_condition',
   `Add conditional visibility to a field.
-   Call when user says "only show X when Y is Z", "X appears for carousel only",
-   "hide X unless Y is enabled", "X only relevant for video".
-   Controlling field must be select, radio-group, or boolean.
-   Cascade check: warns if removing a controlling field would break conditions.
-   Supports AND conditions with multiple controlling fields.`,
+
+   WHEN TO CALL:
+   "only show X when Y is Z"       → operator: ===
+   "X appears for carousel only"   → operator: === values:["carousel"]
+   "X for carousel AND side-carousel" → operator: or values:["carousel","side-carousel"]
+   "hide X unless Y is enabled"    → operator: !==
+   "X only when A is Z AND B is W" → operator: and (use andControllingField + andValues)
+
+   OPERATOR GUIDE — choose carefully:
+   ===  field shows for EXACTLY ONE value e.g. only "carousel" (not side-carousel)
+   or   field shows for ANY OF multiple values e.g. "carousel" OR "side-carousel"
+   !==  field shows for everything EXCEPT one value
+   and  TWO different fields must both match (use andControllingField + andValues)
+
+   ⚠ ALWAYS list the exact values to the user and ask "Is this correct?" before calling.
+   ⚠ "carousel variants" usually means ALL carousel options — use "or" not "===".
+   ⚠ NEVER edit _blockname.json directly to add conditions.
+
+   After calling, this tool returns a CONFIRMATION REQUEST.
+   Show it to the user and wait for approval before generating.`,
   {
     name:             z.string(),
     targetField:      z.string().describe('Field that should show/hide'),
     controllingField: z.string().describe('Field whose value controls visibility'),
-    operator:         z.enum(['===','or','!==','and']).describe('===|or|!==|and'),
-    values:           z.array(z.string()).describe('Values that make field VISIBLE'),
-    applyToChild:     z.boolean().optional().describe('true if target is a child field'),
-    andControllingField: z.string().optional().describe('Second controlling field for AND conditions'),
-    andValues:           z.array(z.string()).optional().describe('Values for the AND condition'),
+    operator:         z.enum(['===','or','!==','and']).describe(
+      '===: one value | or: any of multiple values | !==: not equal | and: two fields must match'
+    ),
+    values:           z.array(z.string()).describe(
+      'Values that make field VISIBLE. For "or": include ALL values e.g. ["carousel","side-carousel"]. For "===": one value only.'
+    ),
+    applyToChild:        z.boolean().optional(),
+    andControllingField: z.string().optional().describe('Second field for AND conditions'),
+    andValues:           z.array(z.string()).optional().describe('Values for the AND condition second field'),
   },
   async ({ name, targetField, controllingField, operator, values,
            applyToChild, andControllingField, andValues }) => {
     const session = getSession(name);
-    if (!session) return txt(`No session for "${name}".`);
+    if (!session) return txt(`No session for "${name}". Call init_block first.`);
 
     const err = validateCondition(session, targetField, controllingField, operator, values);
     if (err) return txt(`✖ ${err}`);
 
-    // AND condition: validate second controlling field too
     if (operator === 'and' && andControllingField && andValues?.length) {
       const err2 = validateCondition(session, targetField, andControllingField, '===', andValues);
       if (err2) return txt(`✖ AND condition error: ${err2}`);
     }
 
+    // Store as pending — require confirmation before applying
+    session._pendingCondition = {
+      targetField, controllingField, operator, values,
+      applyToChild, andControllingField, andValues,
+    };
+    saveSession(session);
+
+    const valDisplay = values.map(v => `"${v}"`).join(' OR ');
+    const opLabel = {
+      '===': 'equals exactly',
+      'or':  'equals any of',
+      '!==': 'does NOT equal',
+      'and': 'equals (with AND condition)',
+    }[operator];
+
+    let msg =
+      `⏸ Condition PENDING — please confirm with user before applying:\n\n` +
+      `  Field to show/hide:  "${targetField}"\n` +
+      `  Controlling field:   "${controllingField}"\n` +
+      `  Operator:            ${operator} (${opLabel})\n` +
+      `  Values:              ${valDisplay}\n`;
+
+    if (operator === 'and' && andControllingField) {
+      msg += `  AND also:            "${andControllingField}" is "${andValues?.join(', ')}"\n`;
+    }
+
+    msg += `\n  JSONLogic preview: ${JSON.stringify(
+      operator === 'and' && andControllingField
+        ? { and: [buildCondition('===', controllingField, values), buildCondition('===', andControllingField, andValues || [])] }
+        : buildCondition(operator, controllingField, values)
+    )}\n\n`;
+
+    msg += `Ask the user: "Should '${targetField}' show when '${controllingField}' is ${valDisplay}? Is this correct?"\n\n`;
+    msg += `  If YES → call confirm_condition("${name}", "${targetField}")\n`;
+    msg += `  If NO  → call add_condition again with corrected values`;
+
+    return txt(msg);
+  }
+);
+
+// ── 8b. confirm_condition ─────────────────────────────────────────────────
+server.tool('confirm_condition',
+  `Apply a pending condition after user confirms the values are correct.
+   Always call this after add_condition and user says "yes" or "correct".
+   NEVER skip this step — conditions must be user-confirmed before applying.`,
+  {
+    name:        z.string(),
+    targetField: z.string().describe('Field name that has a pending condition'),
+  },
+  async ({ name, targetField }) => {
+    const session = getSession(name);
+    if (!session) return txt(`No session for "${name}".`);
+
+    const pending = session._pendingCondition;
+    if (!pending || pending.targetField !== targetField) {
+      return txt(
+        `No pending condition for "${targetField}".\n` +
+        `Call add_condition first, then confirm_condition after user approves.`
+      );
+    }
+
+    const { controllingField, operator, values, applyToChild, andControllingField, andValues } = pending;
+
     saveSession(session, true);
 
     const allFields = [...session.parentFields, ...session.childFields];
-    const target    = allFields.find(f => f.name === (applyToChild ? targetField : targetField));
+    const target    = allFields.find(f => f.name === targetField);
 
     let condition;
     if (operator === 'and' && andControllingField && andValues?.length) {
@@ -1082,16 +1265,72 @@ server.tool('add_condition',
 
     target.condition = condition;
 
-    // Update conditions registry
     const existing = session.conditions.findIndex(c => c.targetField === targetField);
     const record   = { targetField, controllingField, operator, values };
     if (existing >= 0) session.conditions[existing] = record;
     else               session.conditions.push(record);
 
+    delete session._pendingCondition;
     saveSession(session);
+
     return txt(
-      `✔ Condition added:\n  "${targetField}" shows when "${controllingField}" is ${values.join(' OR ')}\n\n` +
-      `  JSONLogic: ${JSON.stringify(condition)}`
+      `✔ Condition confirmed and applied:\n` +
+      `  "${targetField}" shows when "${controllingField}" is ${values.join(' OR ')}\n\n` +
+      `  JSONLogic: ${JSON.stringify(condition)}\n\n` +
+      `  Total conditions: ${session.conditions.length}`
+    );
+  }
+);
+
+// ── 8c. update_condition ──────────────────────────────────────────────────
+server.tool('update_condition',
+  `Replace an existing condition on a field with corrected values.
+   Call when user says "the condition is wrong", "change it to...", "fix the values".
+   Goes through the same confirmation flow as add_condition.
+   NEVER edit _blockname.json directly to fix conditions.`,
+  {
+    name:             z.string(),
+    targetField:      z.string().describe('Field whose condition should be updated'),
+    controllingField: z.string().describe('Controlling field (can be same or different)'),
+    operator:         z.enum(['===','or','!==','and']).describe(
+      '===: one value | or: any of multiple | !==: not equal | and: two fields'
+    ),
+    values:           z.array(z.string()).describe('Corrected values'),
+    andControllingField: z.string().optional(),
+    andValues:           z.array(z.string()).optional(),
+  },
+  async ({ name, targetField, controllingField, operator, values, andControllingField, andValues }) => {
+    const session = getSession(name);
+    if (!session) return txt(`No session for "${name}".`);
+
+    // Check target field exists
+    const allFields = [...session.parentFields, ...session.childFields];
+    if (!allFields.find(f => f.name === targetField)) {
+      return txt(`Field "${targetField}" not found.`);
+    }
+
+    // Validate new condition
+    const err = validateCondition(session, targetField, controllingField, operator, values);
+    if (err) return txt(`✖ ${err}`);
+
+    // Store as pending — requires confirmation
+    session._pendingCondition = { targetField, controllingField, operator, values, andControllingField, andValues };
+    saveSession(session);
+
+    const valDisplay = values.map(v => `"${v}"`).join(' OR ');
+    const existing   = session.conditions.find(c => c.targetField === targetField);
+    const oldDisplay = existing
+      ? `"${existing.controllingField}" is ${existing.values.map(v=>`"${v}"`).join(' OR ')}`
+      : 'none';
+
+    return txt(
+      `⏸ Condition UPDATE PENDING — confirm with user:\n\n` +
+      `  Field:       "${targetField}"\n` +
+      `  Old condition: ${oldDisplay}\n` +
+      `  New condition: "${controllingField}" is ${valDisplay}\n\n` +
+      `  Ask user: "Should the condition be updated to show '${targetField}' when '${controllingField}' is ${valDisplay}?"\n\n` +
+      `  If YES → call confirm_condition("${name}", "${targetField}")\n` +
+      `  If NO  → call update_condition again with different values`
     );
   }
 );
@@ -1386,42 +1625,160 @@ server.tool('validate_block',
 // ── Utility tools ──────────────────────────────────────────────────────────
 function run(cmd) { return execSync(cmd, { cwd: EDS_PROJECT, encoding: 'utf8' }); }
 
-server.tool('list_blocks', 'List all blocks with file status',{},
+server.tool('list_blocks', 'List all blocks in the project with file status',{},
   async () => { try { return txt(run('npx aem-eds-cli list')); } catch(e) { return txt('Error: '+e.message); } }
 );
 
-server.tool('remove_block', 'Remove an existing block', { name: z.string() },
+server.tool('remove_block', 'Remove an existing block and all its files from the project',
+  { name: z.string() },
   async ({name}) => { try { return txt(run(`npx aem-eds-cli remove ${name}`)); } catch(e) { return txt('Error: '+e.message); } }
 );
 
-server.tool('read_block_json', 'Read _blockname.json of an existing block', { name: z.string() },
+server.tool(
+  'read_existing_block_for_reference',
+  `READ ONLY — read an existing block's JSON for reference or comparison.
+
+   ⚠ IMPORTANT — NEVER do any of the following after reading:
+     • Edit _${'{name}'}.json directly
+     • Edit component-definition.json
+     • Edit component-filters.json
+     • Edit component-models.json
+
+   ALLOWED actions after reading:
+     • Show the JSON to the user for information
+     • Call clone_block to create a new session based on this block
+     • Call validate_block to check for issues
+     • Compare with another block's structure
+
+   To MODIFY an existing block:
+     → call clone_block("existing-name", "same-or-new-name") — creates a session
+     → make changes in the session
+     → call generate_block to write safely`,
+  { name: z.string().describe('Block name to read e.g. "carousel"') },
   async ({name}) => {
     const p = path.join(EDS_PROJECT,'blocks',name,`_${name}.json`);
-    return fs.existsSync(p) ? txt(fs.readFileSync(p,'utf8')) : txt(`_${name}.json not found`);
+    if (!fs.existsSync(p)) return txt(`_${name}.json not found in blocks/${name}/`);
+    const content = fs.readFileSync(p,'utf8');
+    return txt(
+      `📖 READ ONLY — blocks/${name}/_${name}.json\n\n` +
+      `⚠ Do NOT edit this file directly.\n` +
+      `  Use clone_block("${name}", "new-name") to modify.\n\n` +
+      content
+    );
   }
 );
 
-server.tool('read_component_filters', 'Read component-filters.json', {},
+server.tool(
+  'read_component_filters',
+  `READ ONLY — read component-filters.json to see which blocks are in section filter.
+
+   ⚠ NEVER edit component-filters.json directly.
+   To add a block: use add_to_section_filter tool.
+   generate_block auto-updates this file safely.`,
+  {},
   async () => {
     const p = path.join(EDS_PROJECT,'component-filters.json');
-    return fs.existsSync(p) ? txt(fs.readFileSync(p,'utf8')) : txt('component-filters.json not found');
+    if (!fs.existsSync(p)) return txt('component-filters.json not found');
+    return txt(
+      `📖 READ ONLY — component-filters.json\n\n` +
+      `⚠ Do NOT edit this file directly.\n` +
+      `  Use add_to_section_filter to add a block.\n\n` +
+      fs.readFileSync(p,'utf8')
+    );
   }
 );
 
-server.tool('add_to_section_filter', 'Add block to section filter in component-filters.json', { name: z.string() },
+server.tool(
+  'read_component_definition',
+  `READ ONLY — read component-definition.json to see all registered block definitions.
+
+   ⚠ NEVER edit component-definition.json directly.
+   generate_block and npm run build:json manage this file automatically.`,
+  {},
+  async () => {
+    const p = path.join(EDS_PROJECT,'component-definition.json');
+    if (!fs.existsSync(p)) return txt('component-definition.json not found');
+    return txt(
+      `📖 READ ONLY — component-definition.json\n\n` +
+      `⚠ Do NOT edit this file directly.\n` +
+      `  Use generate_block + npm run build:json to update.\n\n` +
+      fs.readFileSync(p,'utf8')
+    );
+  }
+);
+
+server.tool(
+  'read_component_models',
+  `READ ONLY — read component-models.json to see all registered field models.
+
+   ⚠ NEVER edit component-models.json directly.
+   generate_block and npm run build:json manage this file automatically.`,
+  {},
+  async () => {
+    const p = path.join(EDS_PROJECT,'component-models.json');
+    if (!fs.existsSync(p)) return txt('component-models.json not found');
+    return txt(
+      `📖 READ ONLY — component-models.json\n\n` +
+      `⚠ Do NOT edit this file directly.\n` +
+      `  Use generate_block + npm run build:json to update.\n\n` +
+      fs.readFileSync(p,'utf8')
+    );
+  }
+);
+
+server.tool(
+  'add_to_section_filter',
+  `Add a block to the section filter in component-filters.json.
+   This is the ONLY safe way to update component-filters.json.
+   generate_block calls this automatically — only use manually if needed.`,
+  { name: z.string() },
   async ({name}) => {
     const p = path.join(EDS_PROJECT,'component-filters.json');
     if (!fs.existsSync(p)) return txt('component-filters.json not found');
     try {
       const json = JSON.parse(fs.readFileSync(p,'utf8'));
       const sec  = json.find(f => f.id==='section');
-      if (!sec) return txt('No section entry found');
+      if (!sec) return txt('No section entry found in component-filters.json');
       if (sec.components.includes(name)) return txt(`"${name}" already in section filter`);
       sec.components.push(name);
       writeAtomic(p, JSON.stringify(json,null,2)+'\n');
-      return txt(`✔ Added "${name}" to section filter`);
+      return txt(`✔ Added "${name}" to section filter in component-filters.json`);
     } catch(e) { return txt('Error: '+e.message); }
   }
+);
+
+server.tool(
+  'get_safety_rules',
+  `Return the complete list of safety rules for working with EDS blocks.
+   Call this if unsure whether an action is safe.`,
+  {},
+  async () => txt(
+    `AEM EDS MCP — Safety Rules\n\n` +
+    `NEVER edit these files directly:\n` +
+    `  • component-definition.json\n` +
+    `  • component-filters.json\n` +
+    `  • component-models.json\n` +
+    `  • models/_section.json\n` +
+    `  • blocks/<name>/_<name>.json\n` +
+    `  • blocks/<name>/<name>.js\n` +
+    `  • blocks/<name>/<name>.css\n\n` +
+    `ALWAYS use these tools instead:\n\n` +
+    `  Creating a block:\n` +
+    `    init_block → add_parent_field → set_child → add_child_field\n` +
+    `    → add_variant → add_condition → confirm_condition → preview_session → generate_block\n\n` +
+    `  Modifying an existing block:\n` +
+    `    clone_block → modify in session → generate_block\n\n` +
+    `  Reading files (read-only):\n` +
+    `    read_existing_block_for_reference\n` +
+    `    read_component_filters\n` +
+    `    read_component_definition\n` +
+    `    read_component_models\n\n` +
+    `  Filters:\n` +
+    `    add_to_section_filter (only safe way to update component-filters.json)\n\n` +
+    `  Conditions:\n` +
+    `    add_condition → confirm_condition (always confirm with user before applying)\n` +
+    `    update_condition → confirm_condition (to fix wrong conditions)\n`
+  )
 );
 
 // ── Start ─────────────────────────────────────────────────────────────────
